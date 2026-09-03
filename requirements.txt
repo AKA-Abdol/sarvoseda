@@ -1,0 +1,32 @@
+# ---- core ----
+numpy>=1.24,<2.3
+soundfile>=0.12.1
+librosa>=0.10.1
+pyyaml>=6.0
+tqdm>=4.66
+pyloudnorm>=0.1.1
+
+# ---- dataset fetch ----
+huggingface_hub>=0.23.0
+requests>=2.31
+pyarrow>=14.0          # parquet-layout HF datasets
+
+# ---- VAD (silence detection) ----
+silero-vad>=5.1
+torch>=2.1
+torchaudio>=2.1
+
+# ---- separation: UVR / MDX-Net (Kim Vocal 2) ----
+audio-separator>=0.28.0
+# GPU:  pip install "audio-separator[gpu]"
+# CPU:  pip install "audio-separator[cpu]"
+
+# ---- quality metrics ----
+onnxruntime>=1.17            # DNSMOS P.835  (use onnxruntime-gpu on CUDA servers)
+# NISQA is installed via scripts/setup_nisqa.sh (separate repo, academic licence)
+
+# ---- optional: distributed backend ----
+# Only for --backend ray (CPU stages across several machines).
+# On a single server --backend process is equivalent and much lighter.
+# pip install "ray[default]>=2.9"
+audioread>=3.0            # missing transitive dep of audio-separator

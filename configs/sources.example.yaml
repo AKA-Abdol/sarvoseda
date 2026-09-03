@@ -1,0 +1,22 @@
+# Queue several Hugging Face datasets:  vcprep run --sources configs/sources.example.yaml
+# Output folders and filenames are named by `name`, so every clip in the final
+# corpus is traceable to the repo it came from.
+sources:
+  - repo_id: MohammadGholizadeh/filimo-farsi-raw
+    name: filimo
+    layout: tar
+    metadata_file: unvalidated.csv
+    metadata_delimiter: "\t"
+    shards: [1, 2, 3]
+
+  - repo_id: mozilla-foundation/common_voice_17_0
+    name: cv17-fa
+    layout: parquet
+    parquet_glob: 'fa/**/*.parquet'
+    audio_column: audio
+    text_column: sentence
+    limit: 50000
+
+  # Shorthand form, one per line, using the CLI spec syntax:
+  # owner/name[@revision][#output-slug]
+  # - ShiftedIsExisting/some-persian-speech@main#extra

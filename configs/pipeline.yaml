@@ -1,0 +1,164 @@
+# Preprocessing pipeline.
+#   HF datasets -> prefilter -> UVR (Kim Vocal 2) -> silence -> quality -> split
+# CLI flags override anything set here.
+
+paths:
+  work_dir: work          # scratch; holds one shard at a time
+  out_dir: out            # clean/ and low_quality/ land here
+  manifest_dir: ''        # default: <work_dir>/manifest (one file per unit)
+
+# ---------------------------------------------------------------------------
+# Queue of Hugging Face datasets. Outputs are foldered and named by `name`
+# (defaults to the repo basename), so a mixed corpus stays traceable.
+# ---------------------------------------------------------------------------
+sources:
+  - repo_id: MohammadGholizadeh/filimo-farsi-raw
+    name: filimo-farsi-raw
+    layout: tar                      # auto | tar | parquet | files
+    tar_glob: 'data/*.tar'
+    shards: []                       # [] = every shard the repo actually has
+    metadata_file: unvalidated.csv   # TAB separated despite the .csv name
+    metadata_delimiter: "\t"
+    metadata_key: file_name
+    metadata_text: sentence
+    limit: 0                         # 0 = no cap
+    limit_per_shard: 0
+
+  # Queue more datasets by adding entries. Parquet repos need no shard config:
+  # - repo_id: mozilla-foundation/common_voice_17_0
+  #   name: cv17-fa
+  #   layout: parquet
+  #   parquet_glob: 'fa/**/*.parquet'
+  #   audio_column: audio
+  #   text_column: sentence
+
+fetch:
+  enabled: true
+  stream: true                # unpack tars from the socket; never land the 1 GB
+  delete_after_separate: true # reclaim raw audio once vocals exist
+
+# ---------------------------------------------------------------------------
+# Cheap gate ahead of the GPU. Lenient by design: it exists only to avoid
+# paying separation cost on clips that plainly contain no speech.
+# ---------------------------------------------------------------------------
+prefilter:
+  enabled: true
+  min_dbfs: -55.0
+  min_duration: 1.0
+  max_duration: 30.0
+  use_vad: true
+  min_speech_seconds: 0.4
+  vad_threshold: 0.30
+
+# ---------------------------------------------------------------------------
+# Vocal isolation.
+#
+# Mel-Band RoFormer scores 12.60 vocal SDR vs Kim Vocal 2's 10.18 and is
+# downloaded on first use. To use a local UVR model instead, set model_path to
+# its absolute path (that overrides model_name/model_dir).
+#
+# Batching matters more than it looks: these models run a fixed inference
+# window (Kim Vocal 2: 256 x 1024 = 5.94 s at 44.1 kHz) and pad anything
+# shorter up to it. With ~2 s utterances, one call per clip measured 1.54x
+# realtime against 9.65x on a long file - ~76% of the time was per-call
+# overhead. Packing clips into one long input recovers that.
+# ---------------------------------------------------------------------------
+separate:
+  enabled: true
+  model_name: vocals_mel_band_roformer.ckpt
+  model_dir: models/separator
+  model_path: ''         # absolute path to a local model; overrides the above
+
+  output_format: WAV
+  sample_rate: 44100
+  normalization_threshold: 0.9
+  use_autocast: false
+  keep_instrumental: false
+
+  batch_clips: true
+  batch_seconds: 300.0        # audio packed per separation call
+  batch_guard_seconds: 0.5    # silence between packed clips
+  batch_peak: 0.7             # per-clip level before packing, restored after
+
+  # Only the block matching the model's architecture is used.
+  mdx_params:                 # MDX-Net  (Kim_Vocal_2.onnx)
+    segment_size: 256
+    overlap: 0.25
+    batch_size: 4
+    hop_length: 1024
+    enable_denoise: false
+  mdxc_params:                # MDXC / RoFormer
+    segment_size: 256
+    override_model_segment_size: false
+    batch_size: 4
+    overlap: 8
+    pitch_shift: 0
+
+# ---------------------------------------------------------------------------
+# Silence / no-speech detection on the separated vocals, plus trimming.
+# Music-only clips surface here: with the instrumental stripped, their speech
+# ratio collapses.
+# ---------------------------------------------------------------------------
+vad:
+  enabled: true
+  threshold: 0.5
+  min_speech_duration_ms: 250
+  min_silence_duration_ms: 300
+  speech_pad_ms: 120
+  min_speech_seconds: 1.0
+  min_speech_ratio: 0.45
+  min_dbfs: -50.0
+  trim: true
+  trim_pad_ms: 150
+  min_trimmed_seconds: 1.0
+  max_trimmed_seconds: 30.0
+
+# ---------------------------------------------------------------------------
+# Quality scoring. Thresholds below are starting points from the literature -
+# run `vcprep calibrate` on a sample and replace them with percentiles of your
+# own distribution before committing to a full run.
+# ---------------------------------------------------------------------------
+quality:
+  enabled: true
+  use_dnsmos: true       # SIG / BAK / OVRL; BAK grades the separator itself
+  use_heuristics: true   # bandwidth, clipping, inter-word SNR
+  use_squim: false       # torchaudio predicted PESQ/STOI
+  use_nisqa: false       # discontinuity axis; academic licence
+
+  dnsmos_dir: models/dnsmos
+  nisqa_repo: third_party/NISQA
+  nisqa_weights: third_party/NISQA/weights/nisqa.tar
+
+  min_ovrl: 2.60
+  min_sig: 3.00
+  min_bak: 3.20
+  min_nisqa_dis: 3.00
+  min_bandwidth_hz: 7000.0
+  max_clipping_ratio: 0.001
+  device: auto
+
+# ---------------------------------------------------------------------------
+# The only stage that decides where files live. Re-runnable in seconds after a
+# threshold change, because every score already sits in the manifest.
+# ---------------------------------------------------------------------------
+materialize:
+  enabled: true
+  clean_dir: clean
+  low_quality_dir: low_quality
+  rejected_dir: rejected
+  mode: move
+  sample_rate: 22050     # seed-vc v2
+  output_format: FLAC
+  mono: true
+  keep_rejected_audio: false
+
+# ---------------------------------------------------------------------------
+# Execution. Only the CPU stages (prefilter, VAD, quality) are parallelised;
+# separation keeps the GPU to itself and gets its speedup from batching.
+#   serial   one process - simplest to debug
+#   process  local process pool - the right default on a single server
+#   ray      distributed - only pays for itself across several machines
+# ---------------------------------------------------------------------------
+backend: process
+num_workers: 0        # 0 = one per CPU core
+log_level: INFO

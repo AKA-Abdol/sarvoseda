@@ -1,0 +1,50 @@
+# seed-vc v2 fine-tuning. Consumes what configs/pipeline.yaml produced.
+
+data:
+  clean_dir: out/clean
+  dataset_dir: seedvc_data
+  include_low_quality: false
+  low_quality_dir: out/low_quality
+  sources: []              # [] = every source in out/clean
+
+  min_duration: 1.0        # seed-vc trains on 1-30 s utterances
+  max_duration: 30.0
+  sample_rate: 22050
+
+  materialize: link        # hardlink: no extra disk
+  max_files: 0
+  val_fraction: 0.01
+  seed: 1234
+
+  # Extra floors on top of the pipeline's own thresholds, read from
+  # metadata.csv. Useful for a stricter first training run without
+  # re-materialising anything.
+  min_dnsmos_ovrl: 0.0
+  min_dnsmos_bak: 0.0
+
+train:
+  repo_dir: third_party/seed-vc
+  config: configs/v2/vc_wrapper.yaml   # resolved inside the seed-vc repo
+  run_name: sarvoseda_fa
+
+  batch_size: 4
+  max_steps: 20000
+  max_epochs: 1000
+  save_every: 1000
+  num_workers: 4
+
+  # V2 has two trainable stages. CFM is the one that carries acoustic quality
+  # and adapts to a new language cheaply; AR needs far more data before it
+  # stops overfitting, so it is off by default.
+  train_cfm: true
+  train_ar: false
+
+  pretrained_cfm_ckpt: null
+  pretrained_ar_ckpt: null
+
+  num_processes: 1         # GPUs
+  mixed_precision: fp16
+  main_process_port: 29500
+  extra_args: []
+
+log_level: INFO

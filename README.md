@@ -1,0 +1,353 @@
+# sarvoseda — speech data pipeline + seed-vc v2 fine-tuning
+
+Two decoupled halves:
+
+| | package | CLI | job |
+|---|---|---|---|
+| 1 | `vcprep` | `vcprep` | HF datasets → UVR → silence removal → quality scoring → `clean/` + `low_quality/` |
+| 2 | `seedvc_ft` | `vcft` | that output → seed-vc v2 fine-tuning |
+
+They share nothing but the on-disk layout, so either can be re-run, replaced or
+shipped without the other.
+
+```
+HF datasets ──► prefilter ──► separation ──────► silence + trim ──► quality ──► clean/
+  (queued)      (cheap VAD)   (Mel-Band RoFormer)   (Silero VAD)    (DNSMOS…)   low_quality/
+                └─ parallel ─┘  └─ GPU, batched ─┘  └──────── parallel ───────┘
+```
+
+---
+
+## Install
+
+```bash
+pip install -e .                  # or: pip install -r requirements.txt
+bash scripts/setup_server.sh      # deps + DNSMOS weights + optional NISQA
+```
+
+`setup_server.sh` detects CUDA and installs `audio-separator[gpu]` +
+`onnxruntime-gpu`, or the CPU wheels otherwise.
+
+The separation model downloads on first use. To use a local UVR model instead:
+
+```bash
+vcprep run --uvr-model "…/Ultimate Vocal Remover.app/Contents/Resources/models/MDX_Net_Models/Kim_Vocal_2.onnx"
+```
+
+---
+
+## Quick start
+
+```bash
+# 1. smoke test — 25 clips from one shard, all stages
+vcprep run --shards 1 --limit-per-shard 25
+
+# 2. see the score distribution, pick thresholds from YOUR data
+vcprep calibrate --target-keep 0.85
+
+# 3. edit configs/pipeline.yaml, then re-split (seconds — no re-scoring)
+vcprep stage materialize
+
+# 4. full run
+vcprep run --config configs/pipeline.yaml --out-dir /data/out --work-dir /scratch \
+           --backend process --num-workers 16
+
+# 5. train
+vcft prepare --clean-dir /data/out/clean --dataset-dir /data/seedvc_data
+vcft train --num-processes 2 --batch-size 8 --max-steps 40000
+```
+
+---
+
+## Disk
+
+The dataset is ~35 GB of tar shards, but the pipeline never holds more than one
+shard. Tars are unpacked **straight from the HTTP socket** — the archive is never
+written — and each stage deletes its input once its output is safe. After a
+shard finishes, only the manifest and the kept audio remain. Budget a few GB of
+scratch regardless of corpus size.
+
+---
+
+## Queuing multiple datasets
+
+Outputs are foldered *and* named by the source repo, so a mixed corpus stays
+traceable: `out/clean/<slug>/<slug>__<original>.flac`.
+
+```bash
+vcprep run --repo MohammadGholizadeh/filimo-farsi-raw \
+           --repo mozilla-foundation/common_voice_17_0#cv17-fa
+
+vcprep run --sources configs/sources.example.yaml
+vcprep plan                       # show the queue without doing anything
+```
+
+`--repo` spec: `owner/name[@revision][#output-slug]`. Three repo layouts are
+auto-detected: **tar** shards, **parquet** (standard HF audio datasets), and
+loose **files**.
+
+---
+
+## The manifest is the source of truth
+
+`work/manifest/<source>/shard_NNN.jsonl` holds one record per utterance: every
+score, every verdict, every reason. Folders are just a *materialisation* of it.
+
+Manifests are **partitioned per work unit** rather than kept in one global file,
+so concurrent units never contend on a single writer and each partition stays
+small enough to rewrite atomically on every flush. `stats` and `calibrate` read
+across partitions.
+
+That split is the point. Retuning a threshold costs a `vcprep stage materialize`
+(seconds), not a re-run of DNSMOS over 400 hours. Every stage is resumable —
+interrupt a run and re-issue it; it picks up exactly where it stopped.
+
+```bash
+vcprep stats                      # where the corpus went, and why
+vcprep stage quality --with-nisqa # re-score without re-separating
+```
+
+---
+
+## Performance
+
+Three independent levers, in the order they matter.
+
+### 1. Batched separation (~6×)
+
+Separation is **overhead-bound, not compute-bound**. These models run a fixed
+inference window — Kim Vocal 2's is 256 frames × 1024 hop = **5.94s at
+44.1 kHz** — and zero-pad anything shorter up to it. Filimo utterances average
+about **2 seconds**, so one call per clip pays for ~6s of work per 2s of audio,
+plus per-call setup. Measured on the same 19s of audio:
+
+| | throughput |
+|---|---|
+| one `separate()` call per clip | 1.54× realtime |
+| the same audio concatenated | 6.41× realtime |
+| a long (114s) file | **9.65× realtime** |
+
+~0.94s of fixed cost per call — **76% of separation time was overhead.**
+Profiling ruled out I/O; pydub and ffmpeg together accounted for under 0.5s of
+12.3s.
+
+So the pipeline packs clips into ~5-minute inputs, separates once, and slices
+the result apart at known offsets. Two details keep that faithful, so a clip's
+output never depends on which batch it landed in:
+
+- each clip is **peak-normalised before packing and restored after**, because
+  the separator normalises its input globally — otherwise one loud clip would
+  quietly attenuate its neighbours;
+- a **0.5s silence guard** sits between clips so neighbouring audio cannot
+  bleed across a boundary inside the model's receptive field.
+
+That is a claim about fidelity, so it ships with a test that checks it:
+
+```bash
+python scripts/validate_batching.py --audio-dir work/raw/<slug>/shard_001
+```
+
+It separates the same clips both ways and reports per-clip correlation, log
+spectral distance and DNSMOS delta. Measured on filimo shard 1 with Kim Vocal 2:
+
+```
+                corr    lsd dB   d_ovrl
+mean          0.9995      8.45   +0.151
+worst         0.9981     12.00   +0.559
+```
+
+Correlation ≥ 0.998 — the same audio. The DNSMOS delta is **positive**, so
+packing is slightly *better* than separating clips alone, not merely
+equivalent. That is not luck: a 2-second clip separated on its own is
+zero-padded to the model's 5.94s window, so the network sees mostly silence,
+which is nothing like its training distribution. Inside a packed batch it
+always sees a full, realistic window. (LSD sits near 8 dB even at this
+correlation because the two runs differ mainly in the low-level residual
+noise floor, where tiny absolute differences are huge in dB. Correlation is
+the metric that decides.)
+
+If correlation ever drops below ~0.99, raise `separate.batch_guard_seconds`.
+Disable packing entirely with `--no-batch-clips`.
+
+### 2. Parallel CPU stages (~N cores)
+
+Prefilter, VAD and quality are embarrassingly parallel and go through a
+pluggable backend:
+
+| backend | when |
+|---|---|
+| `serial` | debugging; no pickling, one process |
+| `process` | **default.** Local process pool — right for a single server |
+| `ray` | several machines. Actor pool keeps models resident between calls |
+
+```bash
+vcprep run --backend process --num-workers 16
+vcprep run --backend ray --ray-address auto      # needs: pip install -e '.[ray]'
+```
+
+Workers are `spawn`-ed, not forked (torch and onnxruntime do not survive a fork
+safely, and a forked CUDA context is a hard error), and each worker pins itself
+to one thread so N workers do not oversubscribe the machine. DNSMOS and Silero
+load once per worker and amortise over thousands of clips.
+
+**A pool is not free.** Each worker is a fresh interpreter that imports torch
+and loads Silero and DNSMOS. On a 12-clip unit a 4-worker pool measured ~55%
+*slower* than serial. So `process` falls back to serial below
+`backends.MIN_PARALLEL_ITEMS` (256 records) automatically — you do not have to
+think about it. Real shards hold thousands of clips per unit, where the pool
+wins decisively; small `--limit-per-shard` smoke tests stay fast.
+
+**On Ray specifically:** on one machine it is not faster than `process` — it
+adds a head node and an object store for no gain. It earns its keep across
+machines, which is why it is implemented behind the same interface but is not
+the default. Switching is a flag, not a rewrite.
+
+### 3. Separation stays single-process on purpose
+
+It is not routed through the backend. Running several copies would multiply
+VRAM rather than throughput; its speedup comes from batching instead.
+
+---
+
+## Design notes
+
+**Prefilter runs before the GPU.** Separation dominates runtime, and a
+movie-sourced corpus is full of music- and effects-only clips. A lenient
+energy+VAD pass on the raw audio skips those before they cost GPU time. It only
+drops the unambiguous; borderline calls go to the post-separation VAD, which
+sees a far cleaner signal.
+
+**Silence detection is neural, not a dB threshold.** The dominant failure mode
+is not digital silence but clips that were pure music: after Kim Vocal 2 strips
+the instrumental, what remains is low-level residue sitting comfortably above
+any sane dBFS gate while containing no speech. Silero VAD separates those cases;
+RMS cannot. In the smoke test, 6 of 25 clips passed an energy gate and were
+correctly caught here as `no_speech`.
+
+**The separator defaults to Mel-Band RoFormer** (`--model-name` takes any model
+in audio-separator's registry; `--uvr-model` takes a local checkpoint; the
+config carries both MDX-Net and MDXC/RoFormer parameter blocks and uses
+whichever matches). **Benchmark it on your own hardware before committing** —
+published SDR did not predict what happened here.
+
+Measured on 40 filimo clips, same audio, both models:
+
+| model | SIG | BAK | OVRL | xRT (MPS) |
+|---|---|---|---|---|
+| Kim Vocal 2 (MDX-Net) | 3.124 | 3.402 | 2.577 | **6.86** |
+| Mel-Band RoFormer | 3.090 | **3.540** | 2.602 | 0.58 |
+
+RoFormer's headline advantage is +2.4 dB SDR on studio music benchmarks. On
+this corpus that converts to **BAK +0.137** — real, above the noise floor, and
+on the axis that matters most here — but **OVRL +0.025**, which is nothing, and
+SIG is marginally *worse*: harder background removal costs a little voice. The
+limiting factor on lossy, band-limited movie audio is the source material, not
+the separator's residual.
+
+The cost ratio above (~12×) is an **Apple Silicon artifact** and should not be
+trusted for your server: RoFormer is a transformer and parallelises far better
+on CUDA than through MPS. Re-measure on the actual GPU:
+
+```bash
+python scripts/compare_separators.py --audio-dir work/raw/<slug>/shard_001 \
+    --model vocals_mel_band_roformer.ckpt --model /path/to/Kim_Vocal_2.onnx \
+    --limit 300
+```
+
+If RoFormer lands within ~2× of Kim Vocal 2 on your GPU, take it for the BAK
+gain. If it is still 10× slower, Kim Vocal 2 buys far more corpus per GPU-hour
+for a 0.025 OVRL difference.
+
+**Quality uses four scorers, and all of DNSMOS's axes.**
+
+| scorer | contributes | why |
+|---|---|---|
+| DNSMOS P.835 | SIG / **BAK** / OVRL | BAK measures residual background — a direct report card on the separator |
+| NISQA v2 | **discontinuity** | the axis DNSMOS lacks; MDX-Net fails by warbling and chopping |
+| SQUIM | predicted PESQ/STOI | free with torchaudio, batches on GPU |
+| heuristics | **bandwidth**, clipping, inter-word SNR | structural defects MOS models score right through |
+
+Bandwidth earns its place. In the smoke test one clip scored DNSMOS
+`ovrl 3.08 / sig 3.47 / bak 3.86` — excellent by every MOS axis — with a
+spectral bandwidth of **6.5 kHz**. It is a lowpassed streaming rip, and training
+a 22.05 kHz model on it teaches the vocoder to synthesise a band the data never
+contains. Only the bandwidth check catches that.
+
+NISQA and SQUIM are opt-in (`--with-nisqa`, `--with-squim`). NISQA carries an
+academic/non-commercial licence — check it before commercial use.
+
+**Failing quality is a demotion, not a deletion.** `low_quality/` keeps the
+audio and its scores, so raising or lowering the bar later is a re-split.
+
+---
+
+## ⚠️ Calibrate before the full run
+
+The shipped thresholds are literature defaults for **English** speech that has
+not been through source separation. On this corpus they are aggressive — a
+25-clip sample kept **31%**:
+
+```
+metric            p10     p25     p50     p75     p90
+dnsmos_ovrl      2.02    2.15    2.76    2.97    3.03
+dnsmos_bak       3.17    3.40    3.52    3.65    3.90
+bandwidth_hz     4253    6245    8010    8581    9475
+```
+
+Filimo audio is heavily band-limited (median 8 kHz), so `min_bandwidth_hz: 7000`
+alone discards roughly a quarter of it. That may well be the right call for a
+22.05 kHz model — but it should be *your* call, made against a real
+distribution. Run a few hundred clips, then:
+
+```bash
+vcprep calibrate --target-keep 0.85
+```
+
+It prints percentiles per axis, a suggested threshold for each, and the joint
+keep rate your current config would produce. Sample size matters: the numbers
+above come from 16 scored clips and are illustrative, not a calibration.
+
+---
+
+## Fine-tuning
+
+```bash
+bash scripts/setup_seedvc.sh          # clone + requirements
+vcft prepare                          # hardlinks clean/ into a seed-vc dataset dir
+vcft train --dry-run                  # print the accelerate command
+vcft train --num-processes 4 --mixed-precision bf16
+vcft status                           # dataset summary + checkpoints
+```
+
+`prepare` **hardlinks** by default, so the training set costs no extra disk. It
+enforces seed-vc's 1–30 s window and can apply a stricter quality floor than the
+pipeline used (`--min-dnsmos-ovrl`) without re-materialising anything.
+
+V2 has two trainable stages. `--train-cfm` (default) carries acoustic quality
+and adapts to a new language relatively cheaply. `--train-ar` needs considerably
+more data before it stops overfitting, so it is off by default.
+
+Checkpoints land in `<seed-vc>/runs/<run-name>/`.
+
+---
+
+## Layout
+
+```
+vcprep/
+  cli.py  config.py  runner.py  audio.py  vad_engine.py  calibrate.py
+  manifest.py    Record, Manifest, ManifestStore (per-unit partitions)
+  stages.py      per-record logic, shared by the serial and parallel paths
+  backends.py    serial | process | ray
+  nodes/     fetch  prefilter  separate  vad  quality  materialize
+  metrics/   dnsmos  nisqa  squim  heuristics
+seedvc_ft/
+  cli.py  config.py  prepare.py  train.py
+configs/   pipeline.yaml  finetune.yaml  sources.example.yaml
+scripts/   setup_server.sh  setup_nisqa.sh  setup_seedvc.sh
+           validate_batching.py    packed vs per-clip separation fidelity
+           compare_separators.py   separation models by DNSMOS on your audio
+```
+
+`stages.py` exists so the serial loop and the pool workers run *exactly* the
+same per-record code — there is no second implementation to drift.

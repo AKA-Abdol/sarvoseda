@@ -1,0 +1,15 @@
+# scratch + outputs
+work/
+out/
+seedvc_data/
+runs/
+
+# downloaded model weights (large; fetched on first use)
+models/
+third_party/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
