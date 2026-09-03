@@ -46,6 +46,29 @@ weights. Override the CUDA build with `CUDA_TAG=cu118 bash scripts/setup_server.
 It refuses to continue if ffmpeg or libsndfile are missing, and prints the
 resolved torch/ONNX providers at the end so you can see the GPU was picked up.
 
+<details>
+<summary><b>If you see <code>AttributeError: module 'onnxruntime' has no attribute 'get_available_providers'</code></b></summary>
+
+`onnxruntime` and `onnxruntime-gpu` install into the *same* `onnxruntime/`
+directory. Uninstalling one deletes files the other still needs, and pip then
+reports the survivor as "already satisfied" and refuses to repair it — leaving a
+package that imports but has no attributes. Remove **both**, then reinstall one:
+
+```bash
+pip uninstall -y onnxruntime onnxruntime-gpu
+pip install --force-reinstall --no-cache-dir onnxruntime-gpu
+python -c "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers())"
+```
+
+If it still fails, delete the directory by hand and reinstall:
+
+```bash
+SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+rm -rf "$SITE/onnxruntime" "$SITE"/onnxruntime*.dist-info
+pip install --no-cache-dir onnxruntime-gpu
+```
+</details>
+
 **Training** (separate shell, separate venv):
 
 ```bash

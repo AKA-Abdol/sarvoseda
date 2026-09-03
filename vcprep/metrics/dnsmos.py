@@ -51,7 +51,7 @@ class DNSMOS:
 
     def __init__(self, model_dir: str, personalized: bool = False,
                  device: str = "auto", num_threads: int = 0):
-        import onnxruntime as ort
+        ort = _import_onnxruntime()
 
         model_path = Path(model_dir) / P835_MODEL
         if not model_path.exists():
@@ -116,6 +116,36 @@ class DNSMOS:
         from ..audio import load_audio
         audio, sr = load_audio(path, sr=SAMPLING_RATE, mono=True)
         return self.score(audio, sr)
+
+
+def _import_onnxruntime():
+    """Import onnxruntime, turning a half-installed package into a clear error.
+
+    onnxruntime and onnxruntime-gpu share the same ``onnxruntime/`` directory,
+    so uninstalling one deletes files the other needs while leaving its
+    dist-info behind. pip then calls the survivor "already satisfied" and will
+    not repair it. The result imports but has no attributes, which otherwise
+    surfaces as a baffling AttributeError deep in a run.
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError(
+            "onnxruntime is not installed (needed for DNSMOS).\n"
+            "  CPU:  pip install onnxruntime\n"
+            "  GPU:  pip install onnxruntime-gpu"
+        ) from exc
+    if not hasattr(ort, "get_available_providers"):
+        raise RuntimeError(
+            f"onnxruntime is installed but broken (loaded {ort.__file__}, "
+            f"no get_available_providers).\n"
+            "This happens when onnxruntime and onnxruntime-gpu were both "
+            "installed and one was then uninstalled - they share a directory.\n"
+            "Repair with:\n"
+            "  pip uninstall -y onnxruntime onnxruntime-gpu\n"
+            "  pip install --force-reinstall --no-cache-dir onnxruntime-gpu"
+        )
+    return ort
 
 
 def _providers(device: str, ort) -> list:

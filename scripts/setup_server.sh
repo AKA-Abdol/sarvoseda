@@ -47,13 +47,39 @@ pip install -e .
 echo "==> separation + ONNX backend"
 if command -v nvidia-smi >/dev/null 2>&1; then
   pip install "audio-separator[gpu]"
-  # Both packages register the same module name; the CPU one wins if present,
-  # silently costing you the GPU.
-  pip uninstall -y onnxruntime >/dev/null 2>&1 || true
-  pip install onnxruntime-gpu
+
+  # onnxruntime and onnxruntime-gpu install into the SAME onnxruntime/
+  # directory. Uninstalling one deletes the shared files the other still needs,
+  # and pip then reports the survivor as "already satisfied" and refuses to
+  # repair it - leaving a package that imports but has no attributes
+  # (AttributeError: no attribute 'get_available_providers').
+  # So: remove BOTH, then force a clean single install.
+  echo "==> installing a clean onnxruntime-gpu"
+  pip uninstall -y onnxruntime onnxruntime-gpu >/dev/null 2>&1 || true
+  SITE="$(python -c 'import site; print(site.getsitepackages()[0])')"
+  rm -rf "$SITE/onnxruntime" "$SITE"/onnxruntime-*.dist-info \
+         "$SITE"/onnxruntime_gpu-*.dist-info 2>/dev/null || true
+  pip install --force-reinstall --no-cache-dir onnxruntime-gpu
 else
   pip install "audio-separator[cpu]"
 fi
+
+# Verify by calling into it, not merely importing it - a gutted install
+# imports fine and only fails later, mid-run.
+python - <<'PY'
+import sys
+try:
+    import onnxruntime as ort
+    providers = ort.get_available_providers()
+except Exception as exc:
+    print(f"ERROR: onnxruntime is broken: {exc}", file=sys.stderr)
+    print("Repair with:", file=sys.stderr)
+    print("  pip uninstall -y onnxruntime onnxruntime-gpu", file=sys.stderr)
+    print("  pip install --force-reinstall --no-cache-dir onnxruntime-gpu",
+          file=sys.stderr)
+    sys.exit(1)
+print(f"onnxruntime {ort.__version__} OK: {providers}")
+PY
 
 echo "==> DNSMOS weights"
 vcprep fetch-models --dnsmos-dir models/dnsmos
