@@ -20,13 +20,43 @@ HF datasets ──► prefilter ──► separation ──────► silen
 
 ## Install
 
+> **Two virtualenvs, not one.** seed-vc pins `torch==2.4.0`, `numpy==1.26.4`
+> and `transformers==4.46.3`; the separation and VAD models need far newer
+> versions of all three. Installed together, whichever went in first breaks.
+> This is why the two halves are separate packages.
+
+System packages first — `audio-separator` shells out to ffmpeg for mp3, and
+`soundfile` needs libsndfile:
+
 ```bash
-pip install -e .                  # or: pip install -r requirements.txt
-bash scripts/setup_server.sh      # deps + DNSMOS weights + optional NISQA
+sudo apt-get install -y ffmpeg libsndfile1 git
 ```
 
-`setup_server.sh` detects CUDA and installs `audio-separator[gpu]` +
-`onnxruntime-gpu`, or the CPU wheels otherwise.
+**Preprocessing:**
+
+```bash
+python -m venv .venv-prep && source .venv-prep/bin/activate
+bash scripts/setup_server.sh
+```
+
+It installs torch **first** from the index matching your driver (later is too
+late — a transitive dependency will otherwise pick a build for the wrong CUDA),
+then the rest, then `audio-separator[gpu]` + `onnxruntime-gpu`, then DNSMOS
+weights. Override the CUDA build with `CUDA_TAG=cu118 bash scripts/setup_server.sh`.
+It refuses to continue if ffmpeg or libsndfile are missing, and prints the
+resolved torch/ONNX providers at the end so you can see the GPU was picked up.
+
+**Training** (separate shell, separate venv):
+
+```bash
+python -m venv .venv-train && source .venv-train/bin/activate
+bash scripts/setup_seedvc.sh
+```
+
+It refuses to run if it detects the preprocessing stack in the same
+environment. In this venv `vcft` runs as `python -m seedvc_ft.cli` — do *not*
+`pip install -e .` here, that would pull `audio-separator` and undo the pins.
+`seedvc_ft` imports only stdlib, yaml and soundfile, so it needs nothing else.
 
 The separation model downloads on first use. To use a local UVR model instead:
 
@@ -103,9 +133,24 @@ That split is the point. Retuning a threshold costs a `vcprep stage materialize`
 interrupt a run and re-issue it; it picks up exactly where it stopped.
 
 ```bash
-vcprep stats                      # where the corpus went, and why
-vcprep stage quality --with-nisqa # re-score without re-separating
+vcprep stats                       # where the corpus went, and why
+vcprep calibrate                   # score distributions + suggested cutoffs
+vcprep rescore                     # re-apply thresholds, reading no audio
+vcprep stage materialize           # move the files to match
+vcprep stage quality --with-nisqa  # re-score without re-separating
 ```
+
+`rescore` is the one that makes threshold tuning cheap. Thresholds are applied
+during the quality stage, so changing them in the config would otherwise mean
+re-scoring the corpus; `rescore` re-runs only the *decision* over metrics
+already in the manifest. Verdicts made earlier (no speech, too short) are not
+threshold-dependent and are left alone. The tuning loop is then:
+
+```
+calibrate  →  edit configs/pipeline.yaml  →  rescore  →  stage materialize
+```
+
+seconds per iteration, on the full corpus.
 
 ---
 

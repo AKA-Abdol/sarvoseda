@@ -4,6 +4,7 @@
     vcprep plan         show the work queue without doing anything
     vcprep stage        run one stage over existing manifest records
     vcprep calibrate    read score distributions, suggest thresholds
+    vcprep rescore      re-apply thresholds to existing scores (no audio read)
     vcprep stats        where the corpus went, and why
     vcprep fetch-models download DNSMOS weights
     vcprep init-config  write a commented YAML you can edit
@@ -132,6 +133,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_exec_opts(stage)
     stage.add_argument("--with-nisqa", action="store_true")
     stage.add_argument("--with-squim", action="store_true")
+
+    # ---- rescore ----
+    rs = sub.add_parser("rescore", parents=[common],
+                        help="re-apply thresholds to existing scores "
+                             "(no audio is read)")
+    add_common(rs)
+    rs.add_argument("--source", help="restrict to one source slug")
+    rs.add_argument("--dry-run", action="store_true",
+                    help="report what would change and stop")
 
     # ---- calibrate ----
     cal = sub.add_parser("calibrate", parents=[common], help="score distributions and thresholds")
@@ -362,6 +372,61 @@ def _shards_of(store, slug: str) -> List[Optional[int]]:
     return sorted(found, key=lambda v: (v is None, v)) or [None]
 
 
+def cmd_rescore(args) -> int:
+    """Re-decide keep vs low_quality from metrics already in the manifest.
+
+    Thresholds are applied during the quality stage, so changing them in the
+    config would otherwise require re-scoring the corpus. This re-runs only the
+    decision, reading no audio, which makes threshold tuning a seconds-long
+    loop: calibrate -> edit config -> rescore -> materialize.
+    """
+    from .manifest import KEEP, LOW_QUALITY, Manifest
+    from .stages import decide_quality
+
+    cfg = build_config(args)
+    store = ManifestStore(cfg.paths.manifest_dir)
+
+    moved = {"keep->low_quality": 0, "low_quality->keep": 0, "unchanged": 0}
+    scored = 0
+    for path in store.partitions():
+        manifest = Manifest(str(path))
+        dirty = False
+        for rec in manifest.records():
+            if args.source and rec.source != args.source:
+                continue
+            # Only records the quality stage actually judged. Anything dropped
+            # earlier (no speech, too short) stays dropped - those verdicts are
+            # not threshold-dependent.
+            if rec.status not in (KEEP, LOW_QUALITY):
+                continue
+            if "dnsmos_ovrl" not in rec.metrics and "bandwidth_hz" not in rec.metrics:
+                continue
+            scored += 1
+            before = rec.status
+            # Drop the previous run's quality labels before re-deciding.
+            for label in rec.metrics.get("quality_failures", []):
+                if label in rec.reasons:
+                    rec.reasons.remove(label)
+            decide_quality(rec, cfg)
+            if rec.status == before:
+                moved["unchanged"] += 1
+            else:
+                moved[f"{before}->{rec.status}"] += 1
+                dirty = True
+            manifest.update(rec)
+        if dirty and not args.dry_run:
+            manifest.flush()
+
+    print(f"scored records examined : {scored}")
+    for key, count in moved.items():
+        print(f"  {key:<22} {count}")
+    if args.dry_run:
+        print("\n(dry run - nothing written)")
+    elif moved["keep->low_quality"] or moved["low_quality->keep"]:
+        print("\nNow run `vcprep stage materialize` to move the files.")
+    return 0
+
+
 def cmd_calibrate(args) -> int:
     from . import calibrate as cal
 
@@ -427,6 +492,7 @@ COMMANDS = {
     "run": cmd_run,
     "plan": cmd_plan,
     "stage": cmd_stage,
+    "rescore": cmd_rescore,
     "calibrate": cmd_calibrate,
     "stats": cmd_stats,
     "fetch-models": cmd_fetch_models,
