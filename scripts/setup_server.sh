@@ -59,18 +59,39 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   SITE="$(python -c 'import site; print(site.getsitepackages()[0])')"
   rm -rf "$SITE/onnxruntime" "$SITE"/onnxruntime-*.dist-info \
          "$SITE"/onnxruntime_gpu-*.dist-info 2>/dev/null || true
-  pip install --force-reinstall --no-cache-dir onnxruntime-gpu
+
+  # onnxruntime-gpu must match torch's CUDA *major* version, or it fails to
+  # load its provider library ("libcublasLt.so.13: cannot open shared object
+  # file") and silently drops to CPU. The cutover:
+  #   onnxruntime-gpu <= 1.26.0  -> CUDA 12
+  #   onnxruntime-gpu >= 1.27.0  -> CUDA 13
+  ORT_SPEC="$(python - <<'PY'
+try:
+    import torch
+    cuda = torch.version.cuda or ""
+except Exception:
+    cuda = ""
+major = cuda.split(".")[0] if cuda else ""
+if major == "12":
+    print("onnxruntime-gpu<1.27")     # newest CUDA 12 line
+elif major == "13":
+    print("onnxruntime-gpu>=1.27")
+else:
+    print("onnxruntime-gpu")          # unknown; take the default
+PY
+)"
+  echo "    torch CUDA -> installing '$ORT_SPEC'"
+  pip install --force-reinstall --no-cache-dir "$ORT_SPEC"
 else
   pip install "audio-separator[cpu]"
 fi
 
-# Verify by calling into it, not merely importing it - a gutted install
-# imports fine and only fails later, mid-run.
+# A gutted install imports fine and only fails later, mid-run, so call into it.
 python - <<'PY'
 import sys
 try:
     import onnxruntime as ort
-    providers = ort.get_available_providers()
+    print(f"onnxruntime {ort.__version__}: {ort.get_available_providers()}")
 except Exception as exc:
     print(f"ERROR: onnxruntime is broken: {exc}", file=sys.stderr)
     print("Repair with:", file=sys.stderr)
@@ -78,9 +99,11 @@ except Exception as exc:
     print("  pip install --force-reinstall --no-cache-dir onnxruntime-gpu",
           file=sys.stderr)
     sys.exit(1)
-print(f"onnxruntime {ort.__version__} OK: {providers}")
 PY
 
+# DNSMOS weights come before the health check: `vcprep doctor` uses the model
+# to build a real CUDA session, which is the only way to tell a working
+# provider from one that is merely listed and silently falls back.
 echo "==> DNSMOS weights"
 vcprep fetch-models --dnsmos-dir models/dnsmos
 
@@ -88,17 +111,9 @@ echo "==> optional: NISQA (adds the discontinuity axis; academic licence)"
 bash scripts/setup_nisqa.sh || echo "NISQA setup skipped"
 
 echo
-python - <<'PY'
-import torch
-import onnxruntime as ort
-print("=" * 60)
-print(f"torch      {torch.__version__}  CUDA={torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"           {torch.cuda.device_count()} GPU(s): "
-          f"{torch.cuda.get_device_name(0)}")
-print(f"onnxruntime providers: {ort.get_available_providers()}")
-print("=" * 60)
-PY
+echo "==> environment check"
+vcprep doctor || true
+
 echo
 echo "Smoke test:"
 echo "  vcprep run --shards 1 --limit-per-shard 25"

@@ -41,10 +41,76 @@ bash scripts/setup_server.sh
 
 It installs torch **first** from the index matching your driver (later is too
 late — a transitive dependency will otherwise pick a build for the wrong CUDA),
-then the rest, then `audio-separator[gpu]` + `onnxruntime-gpu`, then DNSMOS
+then the rest, then `audio-separator[gpu]` + a **CUDA-matched** `onnxruntime-gpu`,
+then DNSMOS
 weights. Override the CUDA build with `CUDA_TAG=cu118 bash scripts/setup_server.sh`.
 It refuses to continue if ffmpeg or libsndfile are missing, and prints the
 resolved torch/ONNX providers at the end so you can see the GPU was picked up.
+
+Check what the machine will actually use before starting a long run:
+
+```bash
+vcprep doctor
+```
+
+It reports the torch device, the onnxruntime providers, and **which engine each
+stage runs on** — then diagnoses any mismatch with the exact fix.
+
+<details>
+<summary><b>If you see <code>CUDAExecutionProvider not available in ONNXruntime</code></b></summary>
+
+**With a RoFormer model this is usually harmless.** The pipeline uses two
+accelerators, and audio-separator's warning only concerns one of them:
+
+| stage | engine | affected? |
+|---|---|---|
+| separation, RoFormer/MDXC `.ckpt` | **PyTorch** | no |
+| separation, MDX-Net `.onnx` | onnxruntime | yes |
+| Silero VAD, SQUIM | PyTorch | no |
+| DNSMOS | onnxruntime | yes |
+
+audio-separator prints that line at import time regardless of which model you
+load. With a RoFormer checkpoint, separation runs on torch — confirm with
+`vcprep doctor` or `python -c "import torch; print(torch.cuda.is_available())"`.
+The real cost is DNSMOS falling back to CPU. That is survivable — DNSMOS is a
+~1 MB model and costs roughly an hour across the whole corpus, less once the
+`process` backend spreads it over cores. If matching CUDA versions turns into a
+rabbit hole, proceeding on CPU is a perfectly reasonable call.
+
+To fix it, `vcprep doctor` names the cause. The two common ones:
+
+- **CPU-only `onnxruntime` installed on a GPU box** — there is no CUDA provider
+  to find. Remove both packages, install the GPU build.
+- **`onnxruntime-gpu` installed but the provider fails to load** — typically
+  `libcublasLt.so.13: cannot open shared object file`. This is a **CUDA major
+  version mismatch** between onnxruntime and torch. onnxruntime loads its CUDA
+  libraries lazily and drops to CPU *silently*, so nothing fails at import.
+
+  | onnxruntime-gpu | built for |
+  |---|---|
+  | ≤ 1.26.0 | CUDA 12 |
+  | ≥ 1.27.0 | CUDA 13 |
+
+  Match it to torch. With `torch==2.6.0+cu124` (CUDA 12), a bare
+  `pip install onnxruntime-gpu` gets you a CUDA 13 build and breaks:
+
+  ```bash
+  python -c "import torch; print(torch.version.cuda)"   # e.g. 12.4
+  pip uninstall -y onnxruntime onnxruntime-gpu
+  pip install --no-cache-dir "onnxruntime-gpu<1.27"     # CUDA 12
+  # (CUDA 13 torch: pip install "onnxruntime-gpu>=1.27")
+  ```
+
+  `scripts/setup_server.sh` now detects `torch.version.cuda` and picks the
+  matching line automatically.
+
+  To see the loader error onnxruntime swallows:
+
+  ```bash
+  python -c "import onnxruntime as o; o.set_default_logger_severity(0); \
+      o.InferenceSession('any.onnx', providers=['CUDAExecutionProvider'])"
+  ```
+</details>
 
 <details>
 <summary><b>If you see <code>AttributeError: module 'onnxruntime' has no attribute 'get_available_providers'</code></b></summary>

@@ -22,7 +22,26 @@ audio-separator>=0.28.0
 # CPU:  pip install "audio-separator[cpu]"
 
 # ---- quality metrics ----
-onnxruntime>=1.17            # DNSMOS P.835  (use onnxruntime-gpu on CUDA servers)
+# DNSMOS P.835. This CPU build is the safe default and works everywhere.
+#
+# On a GPU server, DO NOT just `pip install onnxruntime-gpu`: it must match
+# torch's CUDA MAJOR version, or its provider library fails to load
+# ("libcublasLt.so.13: cannot open shared object file") and onnxruntime falls
+# back to CPU *silently*. Verified from the wheels' own requires_dist:
+#
+#     onnxruntime-gpu <= 1.26.0  ->  CUDA 12
+#     onnxruntime-gpu >= 1.27.0  ->  CUDA 13
+#
+# Check torch, then install the matching line - removing BOTH packages first,
+# because they share one directory and uninstalling either guts the other:
+#
+#     python -c "import torch; print(torch.version.cuda)"
+#     pip uninstall -y onnxruntime onnxruntime-gpu
+#     pip install --no-cache-dir "onnxruntime-gpu<1.27"    # CUDA 12
+#     pip install --no-cache-dir "onnxruntime-gpu>=1.27"   # CUDA 13
+#
+# scripts/setup_server.sh does this automatically. `vcprep doctor` verifies it.
+onnxruntime>=1.17
 # NISQA is installed via scripts/setup_nisqa.sh (separate repo, academic licence)
 
 # ---- optional: distributed backend ----

@@ -155,6 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="report what would change and stop")
 
     # ---- calibrate ----
+    doc = sub.add_parser("doctor", parents=[common],
+                         help="report what each stage will run on (GPU/CPU) "
+                              "and diagnose provider problems")
+
     net = sub.add_parser("netcheck", parents=[common],
                          help="diagnose slow downloads: your link, Hugging "
                               "Face, or single-stream throughput?")
@@ -455,6 +459,16 @@ def cmd_rescore(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    from . import doctor
+
+    try:
+        cfg = build_config(args)
+    except Exception:
+        cfg = None
+    return doctor.run(cfg)
+
+
 def cmd_netcheck(args) -> int:
     from . import netcheck
 
@@ -567,6 +581,7 @@ COMMANDS = {
     "calibrate": cmd_calibrate,
     "stats": cmd_stats,
     "netcheck": cmd_netcheck,
+    "doctor": cmd_doctor,
     "fetch-models": cmd_fetch_models,
     "init-config": cmd_init_config,
 }

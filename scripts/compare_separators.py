@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +40,31 @@ from vcprep.metrics.dnsmos import DNSMOS                   # noqa: E402
 from vcprep.nodes.separate import SeparateNode             # noqa: E402
 
 AXES = ("dnsmos_sig", "dnsmos_bak", "dnsmos_ovrl")
+
+
+def engine_of(model: str) -> str:
+    """Which runtime a model uses. MDX-Net .onnx -> onnxruntime, else torch."""
+    return "onnxruntime" if model.lower().endswith(".onnx") else "torch"
+
+
+def device_of(engine: str) -> str:
+    """The device that engine will really use, right now."""
+    if engine == "onnxruntime":
+        try:
+            import onnxruntime as ort
+            if "CUDAExecutionProvider" in ort.get_available_providers():
+                return "cuda"
+        except Exception:
+            return "unavailable"
+        return "cpu"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(torch.backends, "mps", None)
+        return "mps" if (mps and mps.is_available()) else "cpu"
+    except Exception:
+        return "unavailable"
 
 
 def run_model(cfg: PipelineConfig, model: str, files, work: Path):
@@ -74,6 +100,12 @@ def main() -> int:
                     help="registry name or path; repeatable")
     ap.add_argument("--config", default=None)
     ap.add_argument("--limit", type=int, default=50)
+    ap.add_argument("--batch-seconds", type=float, default=None,
+                    help="audio packed per separation call; smaller gives more "
+                         "frequent progress updates (default 300)")
+    ap.add_argument("--force", action="store_true",
+                    help="compare even when models run on different devices "
+                         "(quality stays valid; timings do not)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.ERROR)
 
@@ -85,24 +117,82 @@ def main() -> int:
     total_audio = sum(probe(str(f))[0] for f in files)
 
     base = PipelineConfig.load(args.config)
+
+    # Say up front what each model will run on. An MDX-Net .onnx goes through
+    # onnxruntime while a RoFormer .ckpt goes through torch, so one can land on
+    # the GPU and the other on the CPU without a word of warning - and then the
+    # timing column compares nothing meaningful.
+    print(f"{'model':<34} {'engine':<12} {'device':<8}")
+    print("-" * 56)
+    plan = []
+    for model in args.model:
+        engine = engine_of(model)
+        device = device_of(engine)
+        plan.append((model, engine, device))
+        print(f"{Path(model).name:<34} {engine:<12} {device:<8}")
+    print()
+
+    devices = {d for _, _, d in plan}
+    if len(devices) > 1:
+        print("!" * 72)
+        print("WARNING: these models are not running on the same device, so the")
+        print("         speed columns below are NOT comparable.")
+        for model, engine, device in plan:
+            print(f"           {Path(model).name} -> {engine} on {device}")
+        cpu_onnx = [m for m, e, d in plan if e == "onnxruntime" and d == "cpu"]
+        if cpu_onnx:
+            print()
+            print("         onnxruntime has no CUDA provider here, so the .onnx")
+            print("         model is on CPU and will be far slower - it is not")
+            print("         hung. Fix with the CUDA-matched runtime:")
+            print("           python -c \"import torch; print(torch.version.cuda)\"")
+            print("           pip uninstall -y onnxruntime onnxruntime-gpu")
+            print("           pip install --no-cache-dir 'onnxruntime-gpu<1.27'  # CUDA 12")
+            print("         Or run `vcprep doctor`. Quality columns stay valid;")
+            print("         only the timings are affected.")
+        print("!" * 72)
+        print()
+        if not args.force:
+            print("Re-run with --force to measure anyway (quality only), or fix")
+            print("the runtime first for meaningful timings.")
+            return 2
+
     mos = DNSMOS(base.quality.dnsmos_dir, device="cpu")
 
     tmp = Path(tempfile.mkdtemp(prefix="vcmp_"))
     results = {}
     try:
-        for model in args.model:
+        for model, engine, device in plan:
             label = Path(model).name
-            print(f"running {label} over {len(files)} clips "
-                  f"({total_audio:.0f}s of audio) ...")
+            print(f"running {label} ({engine} on {device}) over {len(files)} "
+                  f"clips, {total_audio:.0f}s of audio ...", flush=True)
             cfg = PipelineConfig.load(args.config)
+            if args.batch_seconds is not None:
+                cfg.separate.batch_seconds = args.batch_seconds
             outputs, elapsed = run_model(cfg, model, files, tmp / label)
             scores = {axis: [] for axis in AXES}
-            for path in outputs.values():
-                audio, sr = load_audio(path, mono=True)
+            skipped = 0
+            scored_at = time.time()
+            # Scoring used to run silently, which made a stall here look like a
+            # hang in separation. Show it.
+            for path in tqdm(list(outputs.values()), desc=f"scoring {label}",
+                             unit="clip", leave=False):
+                try:
+                    audio, sr = load_audio(path, mono=True)
+                except Exception:
+                    skipped += 1
+                    continue
+                if audio.size == 0:
+                    skipped += 1
+                    continue
                 got = mos.score(audio, sr)
                 for axis in AXES:
                     if got[axis] == got[axis]:
                         scores[axis].append(got[axis])
+            print(f"  scored {len(scores[AXES[0]])} clips in "
+                  f"{time.time() - scored_at:.1f}s"
+                  + (f", skipped {skipped} unreadable/empty" if skipped else ""),
+                  flush=True)
             results[label] = {
                 "n": len(outputs),
                 "seconds": elapsed,

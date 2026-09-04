@@ -82,9 +82,14 @@ class DNSMOS:
         audio = np.asarray(audio, dtype=np.float32).flatten()
 
         len_samples = int(INPUT_LENGTH * SAMPLING_RATE)
-        # The reference implementation tiles short clips up to one full window.
-        while len(audio) < len_samples:
-            audio = np.append(audio, audio)
+        # Tile short clips up to one full window, as the reference does - but
+        # by construction rather than by doubling. The reference's
+        # `while len(audio) < n: audio = np.append(audio, audio)` never
+        # terminates on an empty array, because doubling zero is still zero.
+        if audio.size == 0:
+            return _nan_scores()
+        if audio.size < len_samples:
+            audio = np.tile(audio, int(np.ceil(len_samples / audio.size)))
 
         num_hops = int(np.floor(len(audio) / SAMPLING_RATE) - INPUT_LENGTH) + 1
         hop_samples = SAMPLING_RATE
@@ -102,9 +107,7 @@ class DNSMOS:
             ovrs.append(raw_ovr)
 
         if not sigs:
-            return {"dnsmos_sig": float("nan"),
-                    "dnsmos_bak": float("nan"),
-                    "dnsmos_ovrl": float("nan")}
+            return _nan_scores()
 
         return {
             "dnsmos_sig": float(self.poly["sig"](float(np.mean(sigs)))),
@@ -146,6 +149,14 @@ def _import_onnxruntime():
             "  pip install --force-reinstall --no-cache-dir onnxruntime-gpu"
         )
     return ort
+
+
+def _nan_scores() -> Dict[str, float]:
+    """Unscoreable audio. NaN rather than a low score: thresholds skip NaN, so
+    an unmeasurable clip is never mistaken for a bad one."""
+    return {"dnsmos_sig": float("nan"),
+            "dnsmos_bak": float("nan"),
+            "dnsmos_ovrl": float("nan")}
 
 
 def _providers(device: str, ort) -> list:

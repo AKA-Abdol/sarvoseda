@@ -26,7 +26,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["onnxruntime-gpu>=1.17"]
+# onnxruntime-gpu must match torch's CUDA MAJOR version or its provider
+# library fails to load and it drops to CPU silently. Verified from the
+# wheels' own requires_dist:
+#   <= 1.26.0 -> nvidia-*-cu12  (CUDA 12)
+#   >= 1.27.0 -> nvidia-*-cu13  (CUDA 13)
+# Check yours:  python -c "import torch; print(torch.version.cuda)"
+cuda12 = ["onnxruntime-gpu>=1.17,<1.27"]
+cuda13 = ["onnxruntime-gpu>=1.27"]
 train = ["accelerate>=0.30"]
 # Only needed for --backend ray, i.e. spreading the CPU stages across
 # several machines. On a single server --backend process is equivalent.
