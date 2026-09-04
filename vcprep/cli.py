@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -86,6 +87,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--nisqa-weights", metavar="PATH")
         p.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
 
+    def add_download_opts(p):
+        p.add_argument("--download-mode", choices=["stream", "parallel"],
+                       default=None,
+                       help="'parallel' uses many ranged connections and is "
+                            "usually several times faster on a long-haul link "
+                            "(default). Run `vcprep netcheck` to measure.")
+        p.add_argument("--connections", type=int, default=None,
+                       help="simultaneous connections for parallel downloads "
+                            "(default 8)")
+
     def add_exec_opts(p):
         p.add_argument("--backend", choices=["serial", "process", "ray"],
                        default=None,
@@ -120,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- run ----
     run = sub.add_parser("run", parents=[common], help="run the full pipeline over the queue")
     add_common(run); add_source_opts(run); add_model_opts(run)
-    add_exec_opts(run); add_toggle_opts(run)
+    add_download_opts(run); add_exec_opts(run); add_toggle_opts(run)
 
     # ---- plan ----
     plan = sub.add_parser("plan", parents=[common], help="print the work queue and exit")
@@ -130,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     stage = sub.add_parser("stage", parents=[common], help="run a single stage over the manifest")
     stage.add_argument("name", choices=STAGE_ORDER)
     add_common(stage); add_source_opts(stage); add_model_opts(stage)
-    add_exec_opts(stage)
+    add_download_opts(stage); add_exec_opts(stage)
     stage.add_argument("--with-nisqa", action="store_true")
     stage.add_argument("--with-squim", action="store_true")
 
@@ -144,6 +155,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="report what would change and stop")
 
     # ---- calibrate ----
+    net = sub.add_parser("netcheck", parents=[common],
+                         help="diagnose slow downloads: your link, Hugging "
+                              "Face, or single-stream throughput?")
+    add_source_opts(net)
+    net.add_argument("--connections", type=int, default=8,
+                     help="connections for the parallel probe (default 8)")
+    net.add_argument("--probe-mb", type=int, default=32,
+                     help="megabytes per probe (default 32)")
+    net.add_argument("--skip-baseline", action="store_true",
+                     help="skip the neutral-CDN probe")
+
     cal = sub.add_parser("calibrate", parents=[common], help="score distributions and thresholds")
     add_common(cal)
     cal.add_argument("--source", help="restrict to one source slug")
@@ -276,6 +298,12 @@ def build_config(args) -> PipelineConfig:
         cfg.quality.use_nisqa = True
     if getattr(args, "with_squim", False):
         cfg.quality.use_squim = True
+
+    # ---- downloads ----
+    if getattr(args, "download_mode", None):
+        cfg.fetch.download_mode = args.download_mode
+    if getattr(args, "connections", None) is not None:
+        cfg.fetch.connections = args.connections
 
     # ---- execution ----
     if getattr(args, "backend", None):
@@ -427,6 +455,49 @@ def cmd_rescore(args) -> int:
     return 0
 
 
+def cmd_netcheck(args) -> int:
+    from . import netcheck
+
+    cfg = build_config(args)
+    sources = cfg.active_sources()
+    if not sources:
+        print("no sources configured")
+        return 1
+    src = sources[0]
+
+    url = _probe_url(src)
+    if url is None:
+        print(f"cannot build a probe URL for layout {src.layout!r}")
+        return 1
+
+    token = src.hf_token or os.environ.get("HF_TOKEN")
+    print(f"probing {src.repo_id}")
+    results = netcheck.run(url, token=token,
+                           connections=args.connections,
+                           size=args.probe_mb * 1024 * 1024,
+                           skip_baseline=args.skip_baseline)
+    netcheck.report(results)
+    return 0
+
+
+def _probe_url(src) -> Optional[str]:
+    """Pick a real, large file in the repo to measure against."""
+    from huggingface_hub import HfApi, hf_hub_url
+
+    try:
+        api = HfApi(token=src.hf_token or os.environ.get("HF_TOKEN"))
+        info = api.repo_info(src.repo_id, repo_type="dataset",
+                             revision=src.revision, files_metadata=True)
+        biggest = max((f for f in info.siblings if (f.size or 0) > 0),
+                      key=lambda f: f.size or 0, default=None)
+        if biggest is not None:
+            return hf_hub_url(repo_id=src.repo_id, filename=biggest.rfilename,
+                              repo_type="dataset", revision=src.revision)
+    except Exception as exc:
+        log.debug("could not list repo files: %s", exc)
+    return None
+
+
 def cmd_calibrate(args) -> int:
     from . import calibrate as cal
 
@@ -495,6 +566,7 @@ COMMANDS = {
     "rescore": cmd_rescore,
     "calibrate": cmd_calibrate,
     "stats": cmd_stats,
+    "netcheck": cmd_netcheck,
     "fetch-models": cmd_fetch_models,
     "init-config": cmd_init_config,
 }

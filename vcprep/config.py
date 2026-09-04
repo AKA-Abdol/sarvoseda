@@ -93,6 +93,22 @@ class FetchConfig:
     #: delete each raw clip once it has been separated
     delete_after_separate: bool = True
 
+    #: How to pull tar shards.
+    #:   "stream"    one connection, unpacked on the fly, no tar on disk
+    #:   "parallel"  many ranged connections into a temp file, then unpacked
+    #: A single TCP stream on a long-haul route is capped by the
+    #: bandwidth-delay product well before the link itself saturates, so
+    #: parallel is usually several times faster. Measure yours with
+    #: `vcprep netcheck`. Costs one shard of temporary disk (~1-1.5 GB),
+    #: reclaimed as soon as the shard is unpacked.
+    download_mode: str = "parallel"
+    #: simultaneous connections when download_mode is "parallel"
+    connections: int = 8
+    #: bytes per ranged request; more requests than connections balances load
+    chunk_bytes: int = 16 * 1024 * 1024
+    #: retries per chunk before the shard is abandoned
+    chunk_retries: int = 3
+
 
 @dataclass
 class PrefilterConfig:

@@ -33,6 +33,9 @@ from .base import Node
 log = logging.getLogger(__name__)
 
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus"}
+
+#: Below this many wanted clips, streaming beats downloading a whole shard.
+SMALL_BUDGET = 500
 TEXT_COLUMN_CANDIDATES = ("sentence", "text", "transcription", "transcript",
                           "normalized_text")
 
@@ -211,7 +214,7 @@ class FetchNode(Node):
             budget = min(budget, remaining) if budget else remaining
 
         if layout == "tar":
-            stream = self._iter_tar(src, unit.shard)
+            stream = self._iter_tar(src, unit.shard, budget=budget)
         elif layout == "parquet":
             stream = self._iter_parquet(src)
         else:
@@ -262,12 +265,26 @@ class FetchNode(Node):
     # ------------------------------------------------------------------
     # layout readers -> (name, bytes, inline_text)
     # ------------------------------------------------------------------
-    def _iter_tar(self, src: DatasetSource, shard: Optional[int]
-                  ) -> Iterator[Tuple[str, bytes, str]]:
-        import requests
+    def _tar_filename(self, src: DatasetSource, shard: Optional[int]) -> str:
+        """Repo path of a shard's tar, resolved from the actual file listing.
+
+        Shard ids are discovered from filenames rather than templated, so the
+        reverse lookup has to go through the listing too - the repo's naming is
+        not ours to assume.
+        """
+        for name in self.repo_files(src):
+            if not fnmatch.fnmatch(name, src.tar_glob):
+                continue
+            digits = "".join(ch for ch in Path(name).stem if ch.isdigit())
+            if digits and int(digits) == shard:
+                return name
+        raise FileNotFoundError(f"no tar for shard {shard} in {src.repo_id}")
+
+    def _iter_tar(self, src: DatasetSource, shard: Optional[int],
+                  budget: int = 0) -> Iterator[Tuple[str, bytes, str]]:
         from huggingface_hub import hf_hub_url
 
-        filename = self._tar_name(src, shard)
+        filename = self._tar_filename(src, shard)
         url = hf_hub_url(repo_id=src.repo_id, filename=filename,
                          repo_type="dataset", revision=src.revision)
         headers = {}
@@ -275,13 +292,32 @@ class FetchNode(Node):
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
+        mode = self.cfg.fetch.download_mode
+        # Parallel mode has to land the whole ~1 GB tar before it can unpack
+        # anything. When only a handful of clips are wanted - a smoke test -
+        # streaming stops after a few megabytes instead, which is far cheaper.
+        if mode == "parallel" and 0 < budget <= SMALL_BUDGET:
+            log.info("%s: only %d clip(s) wanted - streaming instead of "
+                     "downloading the whole shard", filename, budget)
+            mode = "stream"
+        if mode == "parallel":
+            yield from self._iter_tar_parallel(src, filename, url, headers)
+        else:
+            yield from self._iter_tar_stream(src, filename, url, headers)
+
+    # ------------------------------------------------------------------
+    def _iter_tar_stream(self, src, filename, url, headers
+                         ) -> Iterator[Tuple[str, bytes, str]]:
+        """One connection, unpacked on the fly. No tar ever touches disk."""
+        import requests
+
         with requests.get(url, stream=True, headers=headers, timeout=120) as resp:
             if resp.status_code == 404:
                 raise FileNotFoundError(filename)
             resp.raise_for_status()
             total = int(resp.headers.get("Content-Length") or 0)
             reader = _ProgressReader(resp.raw, total, desc=f"{src.slug} {filename}")
-            # 'r|*' is streaming mode: sequential, no seeking, constant memory.
+            # 'r|*' = streaming mode: sequential, no seeking, constant memory.
             with tarfile.open(fileobj=reader, mode="r|*") as tar:
                 for member in tar:
                     if not member.isfile():
@@ -291,14 +327,50 @@ class FetchNode(Node):
                         continue
                     yield member.name, handle.read(), ""
 
-    def _tar_name(self, src: DatasetSource, shard: Optional[int]) -> str:
-        for name in self.repo_files(src):
-            if not fnmatch.fnmatch(name, src.tar_glob):
-                continue
-            digits = "".join(ch for ch in Path(name).stem if ch.isdigit())
-            if digits and int(digits) == shard:
-                return name
-        raise FileNotFoundError(f"{src.repo_id}: no tar for shard {shard}")
+    # ------------------------------------------------------------------
+    def _iter_tar_parallel(self, src, filename, url, headers
+                           ) -> Iterator[Tuple[str, bytes, str]]:
+        """Many ranged connections into a temp file, then unpack from disk.
+
+        A single TCP stream is capped by the bandwidth-delay product on a
+        long-haul route, so this is usually several times faster than
+        streaming. It costs one shard of temporary disk, deleted as soon as
+        the shard is unpacked. Falls back to streaming if the CDN will not
+        serve ranges.
+        """
+        fetch = self.cfg.fetch
+        tmp_dir = Path(self.cfg.paths.work_dir) / "_downloads"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        dest = tmp_dir / f"{src.slug}_{Path(filename).name}"
+
+        try:
+            _download_ranged(url, headers, dest,
+                             connections=fetch.connections,
+                             chunk_bytes=fetch.chunk_bytes,
+                             retries=fetch.chunk_retries,
+                             desc=f"{src.slug} {Path(filename).name}")
+        except FileNotFoundError:
+            raise
+        except _RangesUnsupported:
+            log.info("%s: server will not serve ranges - streaming instead",
+                     filename)
+            _unlink(dest)
+            yield from self._iter_tar_stream(src, filename, url, headers)
+            return
+
+        try:
+            with tarfile.open(dest, mode="r:*") as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    handle = tar.extractfile(member)
+                    if handle is None:
+                        continue
+                    yield member.name, handle.read(), ""
+        finally:
+            # The tar is pure scratch - the audio has been written out by now,
+            # and holding 1 GB per shard is exactly what we are avoiding.
+            _unlink(dest)
 
     def _iter_parquet(self, src: DatasetSource) -> Iterator[Tuple[str, bytes, str]]:
         import pyarrow.parquet as pq
@@ -373,3 +445,96 @@ class _ProgressReader(io.RawIOBase):
     def close(self) -> None:
         self._bar.close()
         super().close()
+
+
+class _RangesUnsupported(RuntimeError):
+    """The server would not honour a Range request."""
+
+
+def _download_ranged(url: str, headers: dict, dest: Path, connections: int = 8,
+                     chunk_bytes: int = 16 * 1024 * 1024, retries: int = 3,
+                     desc: str = "") -> Path:
+    """Download ``url`` to ``dest`` using several simultaneous byte ranges.
+
+    Chunks are written with ``os.pwrite`` at their own offsets, which is safe
+    from multiple threads and avoids reassembling parts afterwards.
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    probe = session.get(url, headers={"Range": "bytes=0-0"}, stream=True,
+                        timeout=60)
+    if probe.status_code == 404:
+        probe.close()
+        raise FileNotFoundError(url)
+    if probe.status_code != 206:
+        probe.close()
+        raise _RangesUnsupported(f"status {probe.status_code}")
+    content_range = probe.headers.get("Content-Range", "")
+    probe.close()
+    try:
+        total = int(content_range.split("/")[-1])
+    except (ValueError, IndexError):
+        raise _RangesUnsupported("no Content-Range total")
+
+    spans = [(off, min(chunk_bytes, total - off))
+             for off in range(0, total, chunk_bytes)]
+
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with open(tmp, "wb") as fh:
+        fh.truncate(total)
+
+    bar = tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
+               desc=desc or dest.name, leave=False)
+    fd = os.open(tmp, os.O_WRONLY)
+    try:
+        def fetch_span(span):
+            offset, length = span
+            last = None
+            for attempt in range(retries):
+                written = 0
+                try:
+                    span_headers = {"Range":
+                                    f"bytes={offset}-{offset + length - 1}"}
+                    with session.get(url, headers=span_headers, stream=True,
+                                     timeout=120) as resp:
+                        resp.raise_for_status()
+                        for block in resp.iter_content(chunk_size=1 << 20):
+                            if not block:
+                                continue
+                            os.pwrite(fd, block, offset + written)
+                            written += len(block)
+                            bar.update(len(block))
+                        if written != length:
+                            raise IOError(
+                                f"short range: got {written} of {length}")
+                    return
+                except Exception as exc:               # noqa: BLE001
+                    last = exc
+                    # Un-count what this failed attempt added, or the bar
+                    # would overshoot once the retry re-sends the same bytes.
+                    if written:
+                        bar.update(-written)
+                    log.debug("chunk %d retry %d: %s", offset, attempt + 1, exc)
+            raise IOError(f"chunk at {offset} failed after {retries}: {last}")
+
+        with ThreadPoolExecutor(max_workers=connections) as pool:
+            futures = [pool.submit(fetch_span, span) for span in spans]
+            for future in as_completed(futures):
+                future.result()
+    finally:
+        os.close(fd)
+        bar.close()
+
+    os.replace(tmp, dest)
+    return dest
+
+
+def _unlink(path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

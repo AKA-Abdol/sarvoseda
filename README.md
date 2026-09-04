@@ -177,6 +177,47 @@ seconds per iteration, on the full corpus.
 
 ---
 
+## Slow downloads
+
+The corpus is ~35 GB. Before assuming Hugging Face is at fault, measure — the
+fix differs depending on the answer:
+
+```bash
+vcprep netcheck
+```
+
+It probes a neutral CDN, then HF on one connection, then HF on eight, and tells
+you which of three things you have:
+
+- **Neutral CDN is slow too** → the server's link is the problem, not HF.
+  Nothing here can fix it; you need a better-connected machine or region.
+- **HF is much slower than the CDN** → HF or the route to it. Try a mirror via
+  `HF_ENDPOINT`, or run closer to it.
+- **Eight connections are much faster than one** → the usual case. A single TCP
+  stream is capped by the bandwidth-delay product long before the link
+  saturates. Parallel downloading fixes it.
+
+Parallel downloading is the **default**, using ranged requests into a temp file
+that is unpacked and deleted per shard. Measured here: **2.92 MB/s single
+stream → 9.1 MB/s on 8 connections, 3.11×**, which turns a 4-hour download into
+about 1.2 hours.
+
+```bash
+vcprep run --download-mode parallel --connections 16   # more on a fat link
+vcprep run --download-mode stream                      # zero extra disk
+```
+
+Two behaviours worth knowing:
+
+- It costs ~1–1.5 GB of scratch per shard, reclaimed immediately after unpacking.
+  `--download-mode stream` unpacks on the fly and uses none, at single-stream speed.
+- **Smoke tests automatically stream.** Parallel mode must land a whole 1 GB tar
+  before unpacking anything, so with `--limit-per-shard` below 500 the pipeline
+  streams instead and stops after a few megabytes. You do not have to think
+  about it.
+
+If the server won't serve ranges, it falls back to streaming on its own.
+
 ## Performance
 
 Three independent levers, in the order they matter.
