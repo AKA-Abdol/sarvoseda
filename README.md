@@ -377,6 +377,43 @@ adds a head node and an object store for no gain. It earns its keep across
 machines, which is why it is implemented behind the same interface but is not
 the default. Switching is a flag, not a rewrite.
 
+### Where DNSMOS runs: GPU or CPU
+
+Both are supported and neither is universally right, so it stays your choice.
+
+A typical clip is **one 9-second window at batch size 1**, so DNSMOS is
+latency-bound, not compute-bound — a GPU replaces ~41 ms of CPU math with a
+kernel launch and two transfers, and sits idle in between. Low GPU utilization
+during scoring is the workload's shape, not a misconfiguration.
+
+That makes it a question of how many cores you have. CPU scoring runs at
+~24 clips/s per core:
+
+| cores | ~500k clips |
+|---|---|
+| 2 | ~3 h |
+| 8 | ~43 min |
+| 16 | ~22 min |
+| 32 | ~11 min |
+
+With plenty of cores the CPU pool wins outright and costs no VRAM. With two,
+it cannot keep up and the GPU is the better home — even though utilization
+stays low, it beats a two-core pool.
+
+```bash
+vcprep run --device cuda              # force GPU, whatever the worker count
+vcprep run --device cpu               # force CPU, spread over the pool
+vcprep run --device auto              # default (see below)
+```
+
+`auto` picks the GPU when available **and** workers ≤ `quality.max_gpu_workers`
+(default 4), otherwise CPU — because each worker builds its own DNSMOS session,
+and on `auto` with CUDA present that is one CUDA context per worker, hundreds of
+MB apiece, all contending. Explicit `cuda` or `cpu` is always obeyed.
+
+The same `--device` flag exists on `scripts/compare_separators.py` and
+`scripts/validate_batching.py`.
+
 ### 3. Separation stays single-process on purpose
 
 It is not routed through the backend. Running several copies would multiply

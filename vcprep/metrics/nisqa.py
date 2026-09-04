@@ -23,6 +23,7 @@ import csv
 import logging
 import subprocess
 import sys
+import time
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -44,12 +45,18 @@ class Nisqa:
     over a whole directory rather than per file."""
 
     def __init__(self, repo_dir: str, weights: str, device: str = "auto",
-                 batch_size: int = 10, num_workers: int = 0):
+                 batch_size: int = 10, num_workers: int = 0,
+                 timeout_per_file: float = 2.0, timeout_floor: float = 300.0):
         self.repo = Path(repo_dir)
         self.weights = Path(weights)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.device = device
+        #: A wedged subprocess would otherwise stall the pipeline forever, and
+        #: with output captured there is nothing on screen to show why. Budget
+        #: generously - this is a deadlock guard, not a performance limit.
+        self.timeout_per_file = timeout_per_file
+        self.timeout_floor = timeout_floor
 
         script = self.repo / "run_predict.py"
         if not script.exists():
@@ -65,6 +72,8 @@ class Nisqa:
     def score_dir(self, audio_dir: str) -> Dict[str, Dict[str, float]]:
         """Score every wav in ``audio_dir``. Keys are file *stems*."""
         audio_dir = str(Path(audio_dir).resolve())
+        n_files = sum(1 for _ in Path(audio_dir).glob("*.wav"))
+        timeout = max(self.timeout_floor, n_files * self.timeout_per_file)
         with tempfile.TemporaryDirectory() as tmp:
             cmd = [
                 sys.executable, "run_predict.py",
@@ -75,13 +84,28 @@ class Nisqa:
                 "--bs", str(self.batch_size),
                 "--output_dir", tmp,
             ]
+            log.info("NISQA: scoring %d file(s), timeout %.0fs", n_files, timeout)
             log.debug("NISQA: %s", " ".join(cmd))
-            proc = subprocess.run(cmd, cwd=str(self.repo), capture_output=True,
-                                  text=True)
+            started = time.time()
+            try:
+                proc = subprocess.run(cmd, cwd=str(self.repo),
+                                      capture_output=True, text=True,
+                                      timeout=timeout)
+            except subprocess.TimeoutExpired:
+                log.error("NISQA exceeded %.0fs on %d file(s) and was killed. "
+                          "Continuing without its scores - DNSMOS and the "
+                          "heuristics still apply. Disable it with "
+                          "quality.use_nisqa: false, or raise "
+                          "timeout_per_file.", timeout, n_files)
+                return {}
+            except OSError as exc:
+                log.error("could not run NISQA: %s", exc)
+                return {}
             if proc.returncode != 0:
                 log.error("NISQA failed (%s): %s", proc.returncode,
                           proc.stderr[-2000:])
                 return {}
+            log.info("NISQA finished in %.1fs", time.time() - started)
             return _parse_results(Path(tmp))
 
 

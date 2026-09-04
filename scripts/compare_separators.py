@@ -99,6 +99,8 @@ def main() -> int:
     ap.add_argument("--model", action="append", required=True,
                     help="registry name or path; repeatable")
     ap.add_argument("--config", default=None)
+    ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"],
+                    help="device for DNSMOS scoring (default: from config)")
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--batch-seconds", type=float, default=None,
                     help="audio packed per separation call; smaller gives more "
@@ -157,7 +159,7 @@ def main() -> int:
             print("the runtime first for meaningful timings.")
             return 2
 
-    mos = DNSMOS(base.quality.dnsmos_dir, device="cpu")
+    mos = DNSMOS(base.quality.dnsmos_dir, device=args.device or base.quality.device)
 
     tmp = Path(tempfile.mkdtemp(prefix="vcmp_"))
     results = {}

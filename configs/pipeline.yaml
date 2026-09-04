@@ -135,7 +135,16 @@ quality:
   min_nisqa_dis: 3.00
   min_bandwidth_hz: 7000.0
   max_clipping_ratio: 0.001
+  # Where DNSMOS/SQUIM run. Neither answer is universally right:
+  #   cuda  always the GPU. Best when CPU cores are scarce - DNSMOS is one
+  #         9 s window at batch size 1, so it is latency-bound and a small
+  #         CPU pool cannot keep up.
+  #   cpu   always the CPU, spread over the worker pool. Wins outright when
+  #         cores are plentiful (~24 clips/s per core) and costs no VRAM.
+  #   auto  GPU if available and workers <= max_gpu_workers, else CPU,
+  #         because every worker opens its own CUDA context.
   device: auto
+  max_gpu_workers: 4
 
 # ---------------------------------------------------------------------------
 # The only stage that decides where files live. Re-runnable in seconds after a

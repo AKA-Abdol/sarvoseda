@@ -108,6 +108,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio-dir", required=True)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--device", default=None, choices=["auto", "cpu", "cuda"],
+                    help="device for DNSMOS scoring (default: from config)")
     ap.add_argument("--limit", type=int, default=8)
     ap.add_argument("--guard", type=float, default=None,
                     help="override batch_guard_seconds")
@@ -138,7 +140,7 @@ def main() -> int:
         packed = separate_all(cfg, files, tmp / "packed", batched=True)
 
         from vcprep.metrics.dnsmos import DNSMOS
-        mos = DNSMOS(cfg.quality.dnsmos_dir, device="cpu")
+        mos = DNSMOS(cfg.quality.dnsmos_dir, device=args.device or cfg.quality.device)
 
         print(f"\n{'clip':<28} {'corr':>8} {'lsd dB':>8} {'d_ovrl':>8}")
         print("-" * 56)

@@ -85,7 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="directory holding sig_bak_ovr.onnx")
         p.add_argument("--nisqa-repo", metavar="PATH")
         p.add_argument("--nisqa-weights", metavar="PATH")
-        p.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None)
+        p.add_argument("--device", choices=["auto", "cpu", "cuda"], default=None,
+                       help="where DNSMOS/SQUIM run. 'cuda' forces the GPU "
+                            "regardless of worker count - the right choice on "
+                            "a box with few CPU cores. 'cpu' spreads it over "
+                            "the worker pool, which wins when cores are "
+                            "plentiful. 'auto' (default) picks CPU only past "
+                            "quality.max_gpu_workers workers.")
+        p.add_argument("--max-gpu-workers", type=int, default=None,
+                       help="under --device auto, the worker count above which "
+                            "DNSMOS falls back to CPU (default 4)")
 
     def add_download_opts(p):
         p.add_argument("--download-mode", choices=["stream", "parallel"],
@@ -289,6 +298,8 @@ def build_config(args) -> PipelineConfig:
         cfg.quality.nisqa_weights = args.nisqa_weights
     if getattr(args, "device", None):
         cfg.quality.device = args.device
+    if getattr(args, "max_gpu_workers", None) is not None:
+        cfg.quality.max_gpu_workers = args.max_gpu_workers
 
     # ---- stage toggles ----
     for flag, section in (("no_prefilter", "prefilter"),

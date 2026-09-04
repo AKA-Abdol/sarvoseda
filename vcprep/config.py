@@ -229,7 +229,21 @@ class QualityConfig:
     #: streaming rips are often lowpassed; a 22.05k seed-vc model needs headroom
     min_bandwidth_hz: float = 7000.0
     max_clipping_ratio: float = 0.001
+    #: Where DNSMOS (and SQUIM) run.
+    #:   "cuda"  always the GPU, whatever the worker count
+    #:   "cpu"   always the CPU, spread across the pool
+    #:   "auto"  GPU if available AND workers <= max_gpu_workers, else CPU
+    #:
+    #: Neither is universally right. A typical clip is a single 9 s window at
+    #: batch size 1, so DNSMOS is latency-bound and gains little from a GPU -
+    #: with many cores, CPU workers win outright. But every worker builds its
+    #: own CUDA context, so on a box with few cores the CPU pool is too small
+    #: to keep up and the GPU is the better home. Two cores is squarely in
+    #: that second case.
     device: str = "auto"        # auto | cpu | cuda
+    #: under "auto", the worker count above which DNSMOS is pinned to CPU
+    #: rather than opening one CUDA context per worker
+    max_gpu_workers: int = 4
 
 
 @dataclass

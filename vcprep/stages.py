@@ -27,6 +27,22 @@ log = logging.getLogger(__name__)
 _MODELS: Dict[str, Any] = {}
 
 
+def unusable_reason(audio) -> Optional[str]:
+    """Why this decoded audio cannot be assessed, or None if it is fine.
+
+    Worth checking explicitly rather than trusting the scorers: a clip of
+    NaN/Inf samples does not make the models return NaN, it makes them return
+    finite nonsense that passes every downstream isfinite() guard.
+    """
+    import numpy as np
+
+    if audio is None or getattr(audio, "size", 0) == 0:
+        return "empty_audio"
+    if not np.all(np.isfinite(audio)):
+        return "corrupt_audio"
+    return None
+
+
 def get_dnsmos(cfg: PipelineConfig):
     if "dnsmos" not in _MODELS:
         from .metrics.dnsmos import DNSMOS
@@ -61,6 +77,11 @@ def prefilter_record(rec: Record, cfg: PipelineConfig) -> Record:
             return rec
 
         audio, sr = load_audio(rec.path, mono=True)
+        bad = unusable_reason(audio)
+        if bad:
+            rec.reject(bad, REJECTED)
+            return rec
+
         level = rms_dbfs(audio)
         rec.metrics["raw_rms_dbfs"] = round(level, 2)
         if level < pf.min_dbfs:
@@ -98,6 +119,11 @@ def vad_record(rec: Record, cfg: PipelineConfig, out_dir: str) -> Record:
         from . import vad_engine
 
         audio, sr = load_audio(rec.path, mono=True)
+        bad = unusable_reason(audio)
+        if bad:
+            rec.reject(bad, REJECTED)
+            return rec
+
         level = rms_dbfs(audio)
         rec.metrics["vocal_rms_dbfs"] = round(level, 2)
         if level < vc.min_dbfs:
@@ -183,6 +209,10 @@ def quality_record(rec: Record, cfg: PipelineConfig) -> Record:
     qc = cfg.quality
     try:
         audio, sr = load_audio(rec.path, mono=True)
+        bad = unusable_reason(audio)
+        if bad:
+            rec.reject(bad, REJECTED)
+            return rec
 
         if qc.use_heuristics:
             segments = [tuple(s) for s in rec.metrics.get("speech_segments", [])]

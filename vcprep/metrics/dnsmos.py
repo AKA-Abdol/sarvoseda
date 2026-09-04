@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 SAMPLING_RATE = 16000
 INPUT_LENGTH = 9.01          # seconds per analysis window
 
+#: Plausible bounds for a P.835 score. The scale is 1-5; the polynomial
+#: mapping can land slightly outside, so allow a margin before calling an
+#: output garbage.
+MOS_MIN, MOS_MAX = 0.5, 5.5
+
 P835_MODEL = "sig_bak_ovr.onnx"
 P835_URL = (
     "https://raw.githubusercontent.com/microsoft/DNS-Challenge/master/"
@@ -88,6 +93,13 @@ class DNSMOS:
         # terminates on an empty array, because doubling zero is still zero.
         if audio.size == 0:
             return _nan_scores()
+        # Non-finite samples do NOT produce non-finite scores - the network
+        # returns huge finite garbage (order 1e71) that would pass any
+        # isfinite() guard downstream and be compared against thresholds as if
+        # it were a real measurement.
+        if not np.all(np.isfinite(audio)):
+            log.debug("non-finite samples in input; refusing to score")
+            return _nan_scores()
         if audio.size < len_samples:
             audio = np.tile(audio, int(np.ceil(len_samples / audio.size)))
 
@@ -109,11 +121,19 @@ class DNSMOS:
         if not sigs:
             return _nan_scores()
 
-        return {
+        scores = {
             "dnsmos_sig": float(self.poly["sig"](float(np.mean(sigs)))),
             "dnsmos_bak": float(self.poly["bak"](float(np.mean(baks)))),
             "dnsmos_ovrl": float(self.poly["ovr"](float(np.mean(ovrs)))),
         }
+        # MOS is defined on 1..5. Anything outside a generous band is not a
+        # low score, it is a signal the model was handed something it cannot
+        # represent - report it as unmeasurable rather than as "very bad".
+        if any(not (MOS_MIN <= v <= MOS_MAX) for v in scores.values()):
+            log.debug("implausible DNSMOS output %s; treating as unscoreable",
+                      scores)
+            return _nan_scores()
+        return scores
 
     def score_file(self, path: str) -> Dict[str, float]:
         from ..audio import load_audio

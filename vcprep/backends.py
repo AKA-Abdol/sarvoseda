@@ -147,13 +147,29 @@ class ProcessBackend(Backend):
         # that does not survive a fork safely, and a forked CUDA context is a
         # hard error.
         ctx = mp.get_context("spawn")
+
+        cfg_dict = self.cfg.to_dict()
+        # Every worker builds its own DNSMOS session, so on 'auto' with CUDA
+        # present each one opens its own CUDA context - hundreds of MB apiece,
+        # all contending - for a model that gains little from the GPU (a
+        # typical clip is one 9 s window at batch size 1: latency-bound, not
+        # compute-bound). With plenty of cores the CPU pool wins outright.
+        # With only a few, it cannot keep up and the GPU is the better home,
+        # so pin to CPU only past max_gpu_workers. Explicit 'cuda' or 'cpu'
+        # is always obeyed.
+        quality = cfg_dict.get("quality", {})
+        limit = quality.get("max_gpu_workers", 4)
+        if quality.get("device") == "auto" and workers > limit:
+            quality["device"] = "cpu"
+            log.info("%d workers (> max_gpu_workers=%d): running DNSMOS on CPU. "
+                     "Force the GPU with --device cuda.", workers, limit)
         chunk = max(1, len(payloads) // (workers * 8))
 
         out: List[Record] = []
         with ProcessPoolExecutor(
             max_workers=workers, mp_context=ctx,
             initializer=init_worker,
-            initargs=(self.cfg.to_dict(), extra or {}),
+            initargs=(cfg_dict, extra or {}),
         ) as pool:
             futures = pool.map(_apply, ((worker, p) for p in payloads),
                                chunksize=chunk)
